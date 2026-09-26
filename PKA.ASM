@@ -4,8 +4,15 @@
 include "HARDWARE.INC"
 
 def AudioROM equ $4000
-def AudioBank1 equ $01		;$0E in original ROM
-def AudioBank2 equ $02		;$0F in original ROM
+;AudioBankN is the bank number as the song table headers store it, so the data
+;stays byte for byte what the original ROM holds. PlayerBankN is where this test
+;ROM actually packs the two banks, which keeps it down to 64 KB; GetSeqByte
+;subtracts the difference before selecting a bank.
+def AudioBank1 equ $0E
+def AudioBank2 equ $0F
+def PlayerBank1 equ $01
+def PlayerBank2 equ $02
+def BankOffset equ AudioBank1 - PlayerBank1
 def AudioRAM equ $DE00
 def WaveRAM equ $FF30
 def TrackRAMSize equ $30
@@ -20,7 +27,7 @@ def SFXC4RAM equ $DF60
 
 ;GetSeqByte and SetRomBank live in ROM0 and are stubbed in FUNCTION.ASM
 
-SECTION "Audio 1", ROMX[AudioROM], BANK[AudioBank1]
+SECTION "Audio 1", ROMX[AudioROM], BANK[PlayerBank1]
 
 AudioOff:
 	;Turn off audio
@@ -753,14 +760,14 @@ EnvState3Ch3:
 	and %00001000
 	
 	;Otherwise, is a note
-	jr nz, EnvState3Ch3_2
+	jr nz, EnvState3Ch3_3
 	;If a rest, check data flags
 	ld hl, $2D
 	add hl, de
 	ld a, [hl]
 	;If bit 3 is not set, then get note delay
 	and %00001000
-	jr z, EnvState3Ch3_3
+	jr z, EnvState3Ch3_4
 
 	;Get note delay, high byte
 	ld hl, $08
@@ -772,13 +779,13 @@ EnvState3Ch3:
 	add hl, de
 	cp [hl]
 	;If equal to delay, then get low byte
-	jr z, EnvState3Ch3_4
+	jr z, EnvState3Ch3_2
 	;If more, then set envelope duration to 1
-	jr nc, EnvState3Ch3_3
+	jr nc, EnvState3Ch3_4
 	;Otherwise, set volume and tertiary decay
-	jr EnvState3Ch3_2
+	jr EnvState3Ch3_3
 
-EnvState3Ch3_4:
+EnvState3Ch3_2:
 	ld hl, $07
 	add hl, de
 	ld a, [hl]
@@ -787,10 +794,10 @@ EnvState3Ch3_4:
 	add hl, de
 	cp [hl]
 	;If more or equal, then keep going
-	jr z, EnvState3Ch3_2
-	jr nc, EnvState3Ch3_3
+	jr z, EnvState3Ch3_3
+	jr nc, EnvState3Ch3_4
 
-EnvState3Ch3_2:
+EnvState3Ch3_3:
 	;Set current volume
 	ld a, $10
 	ld hl, $1F
@@ -811,7 +818,7 @@ EnvState3Ch3_2:
 	inc [hl]
 	ret
 
-EnvState3Ch3_3:
+EnvState3Ch3_4:
 	;Set envelope duration to 1
 	ld hl, $1A
 	add hl, de
@@ -1326,7 +1333,11 @@ Multiply16HiNibble:
 	ld d, 0
 	ld h, d
 	ld l, d
-	jr .Multiply16_5
+	jr Multiply16.Multiply16_5
+
+;The full eight-round entry. Nothing calls it, so these first four rounds are
+;unreachable - Multiply16HiNibble above jumps straight past them.
+Multiply16:
 	push de
 	ld e, l
 	ld d, 0
@@ -1707,7 +1718,6 @@ GetEnvSeq:
 	;Get envelope sequence number from parameter
 	call GetSeqByte
 
-GetEnvSeq2:
 	push bc
 	;Get envelope sequence pointer from table
 	add a
@@ -2481,7 +2491,9 @@ OutputTracks:
 	;If gate off, set register value
 	jr z, .SetRegVal
 	
-	;Otherwise, perform RNG?
+	;Otherwise leave channel 1 entirely alone if a sweep is running and its
+	;shadow has not changed - rewriting rNR11-rNR14 would restart it. $08 is
+	;the idle value, so that case falls through and writes normally.
 	ldh a, [c]
 	and d
 	cp 8
@@ -2498,52 +2510,59 @@ OutputTracks:
 	inc c
 	inc l
 	inc c
-	jr DoAllRegs2
+	jr OutputCh2Regs
 
 .SetRegVal
-	;Set temporary copy variable to register value
+	;rNR10 gets the shadow written to it twice in a row - the same value to
+	;the same port. A deliberate workaround for a sweep quirk; no other
+	;register is treated this way.
 	ld a, [hl]
-	;Also load to real register
 	ldh [c], a
 	ldh [c], a
 	inc l
 	inc c
 	ld d, $C0
 
-DoAllRegs:
-	;Copy all register values in RAM to actual values and set appropriately
-	call OutputRegTrig_2B
+;Channel 1, rNR11-rNR14. rNR10 was written above, before the skip test.
+OutputCh1Regs:
+	call OutputRegMasked
 	ld a, b
 	call OutputRegTrig
 	ld a, b
-	call OutputRegWithTrig2
-	call OutputRegWithTrig2_3
+	call OutputRegForce
+	call OutputRegTrigClear
 
-DoAllRegs2:
-	;Do some more output
+;Channel 2, rNR21-rNR24.
+OutputCh2Regs:
 	inc c
 	ld d, %11000000
-	call OutputRegTrig_2B
+	call OutputRegMasked
 	ld a, [Gate2Off]
 	call OutputRegTrig
-	call OutputRegWithTrig2
-	call OutputRegWithTrig2_3
+	call OutputRegForce
+	call OutputRegTrigClear
+
+;Channel 3, rNR30-rNR34. rNR31 is the length counter and is skipped.
+OutputCh3Regs:
 	ld d, %10000000
-	call OutputRegTrig_2B
+	call OutputRegMasked
 	inc l
 	inc c
 	ld d, %01100000
-	call OutputRegTrig_2B
-	call OutputRegWithTrig2
-	call OutputRegWithTrig2_3
+	call OutputRegMasked
+	call OutputRegForce
+	call OutputRegTrigClear
+
+;Channel 4, rNR42-rNR44. rNR41 is the length counter and is skipped.
+OutputCh4Regs:
 	inc c
 	inc l
 	inc c
 	ld a, [Gate4Off]
 	call OutputRegTrig
 	ld d, $FF
-	call OutputRegTrig_2B
-	call OutputRegWithTrig2_3
+	call OutputRegMasked
+	call OutputRegTrigClear
 
 	;Output NR50 and NR51 values
 	ld hl, $FF24
@@ -2656,7 +2675,7 @@ OutputRegTrig:
 	jr z, OutputRegTrig_2
 	ldh a, [c]
 	cp [hl]
-	jr z, OutputRegWithTrig2_2
+	jr z, SkipReg
 
 OutputRegTrig_2:
 	;Get next register value from RAM
@@ -2669,26 +2688,26 @@ OutputRegTrig_2:
 	inc c
 	ret
 
-OutputRegTrig_2B:
+OutputRegMasked:
 	ldh a, [c]
 	and d
 
 	;Otherwise, check if main value is the same
 	cp [hl]
 	;If so, then return
-	jr z, OutputRegWithTrig2_2
+	jr z, SkipReg
 
 ;Otherwise, output new value
-OutputRegWithTrig2:
+OutputRegForce:
 	ld a, [hl]
 	ldh [c], a
 
-OutputRegWithTrig2_2:
+SkipReg:
 	inc l
 	inc c
 	ret
 
-OutputRegWithTrig2_3:
+OutputRegTrigClear:
 	ld a, [hl]
 	ldh [c], a
 	and %00000111
@@ -6640,11 +6659,11 @@ SECTION "Audio RAM MusC1", WRAMX[MusC1RAM]
 MusC1MusNum: ds 1		;$DE00 = $00
 MusC1Priority: ds 1		;$DE01 = $01
 MusC1Sweep: ds 1		;$DE02 = $02
-MusC1Transpose: ds 1		;$DE03 = $03
+MusC1Transpose: ds 1	;$DE03 = $03
 MusC1Tuning: ds 1		;$DE04 = $04
 MusC1VolFinal: ds 1		;$DE05 = $05
-MusC1VolOutput: ds 1		;$DE06 = $06
-MusC1NoteDelay: ds 2		;$DE07 = $07
+MusC1VolOutput: ds 1	;$DE06 = $06
+MusC1NoteDelay: ds 2	;$DE07 = $07
 MusC1Speed: ds 1		;$DE09 = $09
 MusC1DutyVol: ds 1		;$DE0A = $0A
 MusC1Decay: ds 1		;$DE0B = $0B
@@ -6653,26 +6672,26 @@ MusC1Vibrato: ds 2		;$DE0D = $0D
 MusC1EnvVal: ds 1		;$DE0F = $0F
 MusC1Decay2: ds 1		;$DE10 = $10
 MusC1Decay3: ds 1		;$DE11 = $11
-MusC1ReleaseTime: ds 2		;$DE12 = $12
-MusC1EnvSeqPtr: ds 2		;$DE14 = $14
+MusC1ReleaseTime: ds 2	;$DE12 = $12
+MusC1EnvSeqPtr: ds 2	;$DE14 = $14
 MusC1VibStep: ds 1		;$DE16 = $16
-MusC1EnvSeqPos: ds 1		;$DE17 = $17
+MusC1EnvSeqPos: ds 1	;$DE17 = $17
 MusC1EnvStep: ds 1		;$DE18 = $18
-MusC1VibSeqDelay: ds 1		;$DE19 = $19
+MusC1VibSeqDelay: ds 1	;$DE19 = $19
 MusC1EnvDur: ds 1		;$DE1A = $1A
 MusC1Octave: ds 1		;$DE1B = $1B
 MusC1VibVal: ds 1		;$DE1C = $1C
-MusC1Freq: ds 2		;$DE1D = $1D
+MusC1Freq: ds 2			;$DE1D = $1D
 MusC1VolCur: ds 1		;$DE1F = $1F
 MusC1SongPos: ds 2		;$DE20 = $20
-MusC1Repeat1Start: ds 2		;$DE22 = $22
-MusC1Repeat2Start: ds 2		;$DE24 = $24
-MusC1Macro1Pos: ds 2		;$DE26 = $26
-MusC1Macro2Pos: ds 2		;$DE28 = $28
-MusC1Repeat1Times: ds 1		;$DE2A = $2A
-MusC1Repeat2Times: ds 1		;$DE2B = $2B
-MusC1NoteFlags: ds 1		;$DE2C = $2C
-MusC1DataFlags: ds 1		;$DE2D = $2D
+MusC1Repeat1Start: ds 2	;$DE22 = $22
+MusC1Repeat2Start: ds 2	;$DE24 = $24
+MusC1Macro1Pos: ds 2	;$DE26 = $26
+MusC1Macro2Pos: ds 2	;$DE28 = $28
+MusC1Repeat1Times: ds 1	;$DE2A = $2A
+MusC1Repeat2Times: ds 1	;$DE2B = $2B
+MusC1NoteFlags: ds 1	;$DE2C = $2C
+MusC1DataFlags: ds 1	;$DE2D = $2D
 MusC1DataBank: ds 1		;$DE2E = $2E
 MusC1Unused2F: ds 1		;$DE2F = $2F
 
@@ -6680,11 +6699,11 @@ SECTION "Audio RAM MusC2", WRAMX[MusC2RAM]
 MusC2MusNum: ds 1		;$DE30 = $00
 MusC2Priority: ds 1		;$DE31 = $01
 MusC2Sweep: ds 1		;$DE32 = $02
-MusC2Transpose: ds 1		;$DE33 = $03
+MusC2Transpose: ds 1	;$DE33 = $03
 MusC2Tuning: ds 1		;$DE34 = $04
 MusC2VolFinal: ds 1		;$DE35 = $05
-MusC2VolOutput: ds 1		;$DE36 = $06
-MusC2NoteDelay: ds 2		;$DE37 = $07
+MusC2VolOutput: ds 1	;$DE36 = $06
+MusC2NoteDelay: ds 2	;$DE37 = $07
 MusC2Speed: ds 1		;$DE39 = $09
 MusC2DutyVol: ds 1		;$DE3A = $0A
 MusC2Decay: ds 1		;$DE3B = $0B
@@ -6693,26 +6712,26 @@ MusC2Vibrato: ds 2		;$DE3D = $0D
 MusC2EnvVal: ds 1		;$DE3F = $0F
 MusC2Decay2: ds 1		;$DE40 = $10
 MusC2Decay3: ds 1		;$DE41 = $11
-MusC2ReleaseTime: ds 2		;$DE42 = $12
-MusC2EnvSeqPtr: ds 2		;$DE44 = $14
+MusC2ReleaseTime: ds 2	;$DE42 = $12
+MusC2EnvSeqPtr: ds 2	;$DE44 = $14
 MusC2VibStep: ds 1		;$DE46 = $16
-MusC2EnvSeqPos: ds 1		;$DE47 = $17
+MusC2EnvSeqPos: ds 1	;$DE47 = $17
 MusC2EnvStep: ds 1		;$DE48 = $18
-MusC2VibSeqDelay: ds 1		;$DE49 = $19
+MusC2VibSeqDelay: ds 1	;$DE49 = $19
 MusC2EnvDur: ds 1		;$DE4A = $1A
 MusC2Octave: ds 1		;$DE4B = $1B
 MusC2VibVal: ds 1		;$DE4C = $1C
-MusC2Freq: ds 2		;$DE4D = $1D
+MusC2Freq: ds 2			;$DE4D = $1D
 MusC2VolCur: ds 1		;$DE4F = $1F
 MusC2SongPos: ds 2		;$DE50 = $20
-MusC2Repeat1Start: ds 2		;$DE52 = $22
-MusC2Repeat2Start: ds 2		;$DE54 = $24
-MusC2Macro1Pos: ds 2		;$DE56 = $26
-MusC2Macro2Pos: ds 2		;$DE58 = $28
-MusC2Repeat1Times: ds 1		;$DE5A = $2A
-MusC2Repeat2Times: ds 1		;$DE5B = $2B
-MusC2NoteFlags: ds 1		;$DE5C = $2C
-MusC2DataFlags: ds 1		;$DE5D = $2D
+MusC2Repeat1Start: ds 2	;$DE52 = $22
+MusC2Repeat2Start: ds 2	;$DE54 = $24
+MusC2Macro1Pos: ds 2	;$DE56 = $26
+MusC2Macro2Pos: ds 2	;$DE58 = $28
+MusC2Repeat1Times: ds 1	;$DE5A = $2A
+MusC2Repeat2Times: ds 1	;$DE5B = $2B
+MusC2NoteFlags: ds 1	;$DE5C = $2C
+MusC2DataFlags: ds 1	;$DE5D = $2D
 MusC2DataBank: ds 1		;$DE5E = $2E
 MusC2Unused2F: ds 1		;$DE5F = $2F
 
@@ -6720,11 +6739,11 @@ SECTION "Audio RAM MusC3", WRAMX[MusC3RAM]
 MusC3MusNum: ds 1		;$DE60 = $00
 MusC3Priority: ds 1		;$DE61 = $01
 MusC3Sweep: ds 1		;$DE62 = $02
-MusC3Transpose: ds 1		;$DE63 = $03
+MusC3Transpose: ds 1	;$DE63 = $03
 MusC3Tuning: ds 1		;$DE64 = $04
 MusC3VolFinal: ds 1		;$DE65 = $05
-MusC3VolOutput: ds 1		;$DE66 = $06
-MusC3NoteDelay: ds 2		;$DE67 = $07
+MusC3VolOutput: ds 1	;$DE66 = $06
+MusC3NoteDelay: ds 2	;$DE67 = $07
 MusC3Speed: ds 1		;$DE69 = $09
 MusC3DutyVol: ds 1		;$DE6A = $0A
 MusC3Decay: ds 1		;$DE6B = $0B
@@ -6733,26 +6752,26 @@ MusC3Vibrato: ds 2		;$DE6D = $0D
 MusC3EnvVal: ds 1		;$DE6F = $0F
 MusC3Decay2: ds 1		;$DE70 = $10
 MusC3Decay3: ds 1		;$DE71 = $11
-MusC3ReleaseTime: ds 2		;$DE72 = $12
-MusC3EnvSeqPtr: ds 2		;$DE74 = $14
+MusC3ReleaseTime: ds 2	;$DE72 = $12
+MusC3EnvSeqPtr: ds 2	;$DE74 = $14
 MusC3VibStep: ds 1		;$DE76 = $16
-MusC3EnvSeqPos: ds 1		;$DE77 = $17
+MusC3EnvSeqPos: ds 1	;$DE77 = $17
 MusC3EnvStep: ds 1		;$DE78 = $18
-MusC3VibSeqDelay: ds 1		;$DE79 = $19
+MusC3VibSeqDelay: ds 1	;$DE79 = $19
 MusC3EnvDur: ds 1		;$DE7A = $1A
 MusC3Octave: ds 1		;$DE7B = $1B
 MusC3VibVal: ds 1		;$DE7C = $1C
-MusC3Freq: ds 2		;$DE7D = $1D
+MusC3Freq: ds 2			;$DE7D = $1D
 MusC3VolCur: ds 1		;$DE7F = $1F
 MusC3SongPos: ds 2		;$DE80 = $20
-MusC3Repeat1Start: ds 2		;$DE82 = $22
-MusC3Repeat2Start: ds 2		;$DE84 = $24
-MusC3Macro1Pos: ds 2		;$DE86 = $26
-MusC3Macro2Pos: ds 2		;$DE88 = $28
-MusC3Repeat1Times: ds 1		;$DE8A = $2A
-MusC3Repeat2Times: ds 1		;$DE8B = $2B
-MusC3NoteFlags: ds 1		;$DE8C = $2C
-MusC3DataFlags: ds 1		;$DE8D = $2D
+MusC3Repeat1Start: ds 2	;$DE82 = $22
+MusC3Repeat2Start: ds 2	;$DE84 = $24
+MusC3Macro1Pos: ds 2	;$DE86 = $26
+MusC3Macro2Pos: ds 2	;$DE88 = $28
+MusC3Repeat1Times: ds 1	;$DE8A = $2A
+MusC3Repeat2Times: ds 1	;$DE8B = $2B
+MusC3NoteFlags: ds 1	;$DE8C = $2C
+MusC3DataFlags: ds 1	;$DE8D = $2D
 MusC3DataBank: ds 1		;$DE8E = $2E
 MusC3Unused2F: ds 1		;$DE8F = $2F
 
@@ -6760,11 +6779,11 @@ SECTION "Audio RAM MusC4", WRAMX[MusC4RAM]
 MusC4MusNum: ds 1		;$DE90 = $00
 MusC4Priority: ds 1		;$DE91 = $01
 MusC4Sweep: ds 1		;$DE92 = $02
-MusC4Transpose: ds 1		;$DE93 = $03
+MusC4Transpose: ds 1	;$DE93 = $03
 MusC4Tuning: ds 1		;$DE94 = $04
 MusC4VolFinal: ds 1		;$DE95 = $05
-MusC4VolOutput: ds 1		;$DE96 = $06
-MusC4NoteDelay: ds 2		;$DE97 = $07
+MusC4VolOutput: ds 1	;$DE96 = $06
+MusC4NoteDelay: ds 2	;$DE97 = $07
 MusC4Speed: ds 1		;$DE99 = $09
 MusC4DutyVol: ds 1		;$DE9A = $0A
 MusC4Decay: ds 1		;$DE9B = $0B
@@ -6773,26 +6792,26 @@ MusC4Vibrato: ds 2		;$DE9D = $0D
 MusC4EnvVal: ds 1		;$DE9F = $0F
 MusC4Decay2: ds 1		;$DEA0 = $10
 MusC4Decay3: ds 1		;$DEA1 = $11
-MusC4ReleaseTime: ds 2		;$DEA2 = $12
-MusC4EnvSeqPtr: ds 2		;$DEA4 = $14
+MusC4ReleaseTime: ds 2	;$DEA2 = $12
+MusC4EnvSeqPtr: ds 2	;$DEA4 = $14
 MusC4VibStep: ds 1		;$DEA6 = $16
-MusC4EnvSeqPos: ds 1		;$DEA7 = $17
+MusC4EnvSeqPos: ds 1	;$DEA7 = $17
 MusC4EnvStep: ds 1		;$DEA8 = $18
-MusC4VibSeqDelay: ds 1		;$DEA9 = $19
+MusC4VibSeqDelay: ds 1	;$DEA9 = $19
 MusC4EnvDur: ds 1		;$DEAA = $1A
 MusC4Octave: ds 1		;$DEAB = $1B
 MusC4VibVal: ds 1		;$DEAC = $1C
-MusC4Freq: ds 2		;$DEAD = $1D
+MusC4Freq: ds 2			;$DEAD = $1D
 MusC4VolCur: ds 1		;$DEAF = $1F
 MusC4SongPos: ds 2		;$DEB0 = $20
-MusC4Repeat1Start: ds 2		;$DEB2 = $22
-MusC4Repeat2Start: ds 2		;$DEB4 = $24
-MusC4Macro1Pos: ds 2		;$DEB6 = $26
-MusC4Macro2Pos: ds 2		;$DEB8 = $28
-MusC4Repeat1Times: ds 1		;$DEBA = $2A
-MusC4Repeat2Times: ds 1		;$DEBB = $2B
-MusC4NoteFlags: ds 1		;$DEBC = $2C
-MusC4DataFlags: ds 1		;$DEBD = $2D
+MusC4Repeat1Start: ds 2	;$DEB2 = $22
+MusC4Repeat2Start: ds 2	;$DEB4 = $24
+MusC4Macro1Pos: ds 2	;$DEB6 = $26
+MusC4Macro2Pos: ds 2	;$DEB8 = $28
+MusC4Repeat1Times: ds 1	;$DEBA = $2A
+MusC4Repeat2Times: ds 1	;$DEBB = $2B
+MusC4NoteFlags: ds 1	;$DEBC = $2C
+MusC4DataFlags: ds 1	;$DEBD = $2D
 MusC4DataBank: ds 1		;$DEBE = $2E
 MusC4Unused2F: ds 1		;$DEBF = $2F
 
@@ -6800,11 +6819,11 @@ SECTION "Audio RAM SFXC1", WRAMX[SFXC1RAM]
 SFXC1MusNum: ds 1		;$DEC0 = $00
 SFXC1Priority: ds 1		;$DEC1 = $01
 SFXC1Sweep: ds 1		;$DEC2 = $02
-SFXC1Transpose: ds 1		;$DEC3 = $03
+SFXC1Transpose: ds 1	;$DEC3 = $03
 SFXC1Tuning: ds 1		;$DEC4 = $04
 SFXC1VolFinal: ds 1		;$DEC5 = $05
-SFXC1VolOutput: ds 1		;$DEC6 = $06
-SFXC1NoteDelay: ds 2		;$DEC7 = $07
+SFXC1VolOutput: ds 1	;$DEC6 = $06
+SFXC1NoteDelay: ds 2	;$DEC7 = $07
 SFXC1Speed: ds 1		;$DEC9 = $09
 SFXC1DutyVol: ds 1		;$DECA = $0A
 SFXC1Decay: ds 1		;$DECB = $0B
@@ -6813,26 +6832,26 @@ SFXC1Vibrato: ds 2		;$DECD = $0D
 SFXC1EnvVal: ds 1		;$DECF = $0F
 SFXC1Decay2: ds 1		;$DED0 = $10
 SFXC1Decay3: ds 1		;$DED1 = $11
-SFXC1ReleaseTime: ds 2		;$DED2 = $12
-SFXC1EnvSeqPtr: ds 2		;$DED4 = $14
+SFXC1ReleaseTime: ds 2	;$DED2 = $12
+SFXC1EnvSeqPtr: ds 2	;$DED4 = $14
 SFXC1VibStep: ds 1		;$DED6 = $16
-SFXC1EnvSeqPos: ds 1		;$DED7 = $17
+SFXC1EnvSeqPos: ds 1	;$DED7 = $17
 SFXC1EnvStep: ds 1		;$DED8 = $18
-SFXC1VibSeqDelay: ds 1		;$DED9 = $19
+SFXC1VibSeqDelay: ds 1	;$DED9 = $19
 SFXC1EnvDur: ds 1		;$DEDA = $1A
 SFXC1Octave: ds 1		;$DEDB = $1B
 SFXC1VibVal: ds 1		;$DEDC = $1C
-SFXC1Freq: ds 2		;$DEDD = $1D
+SFXC1Freq: ds 2			;$DEDD = $1D
 SFXC1VolCur: ds 1		;$DEDF = $1F
 SFXC1SongPos: ds 2		;$DEE0 = $20
-SFXC1Repeat1Start: ds 2		;$DEE2 = $22
-SFXC1Repeat2Start: ds 2		;$DEE4 = $24
-SFXC1Macro1Pos: ds 2		;$DEE6 = $26
-SFXC1Macro2Pos: ds 2		;$DEE8 = $28
-SFXC1Repeat1Times: ds 1		;$DEEA = $2A
-SFXC1Repeat2Times: ds 1		;$DEEB = $2B
-SFXC1NoteFlags: ds 1		;$DEEC = $2C
-SFXC1DataFlags: ds 1		;$DEED = $2D
+SFXC1Repeat1Start: ds 2	;$DEE2 = $22
+SFXC1Repeat2Start: ds 2	;$DEE4 = $24
+SFXC1Macro1Pos: ds 2	;$DEE6 = $26
+SFXC1Macro2Pos: ds 2	;$DEE8 = $28
+SFXC1Repeat1Times: ds 1	;$DEEA = $2A
+SFXC1Repeat2Times: ds 1	;$DEEB = $2B
+SFXC1NoteFlags: ds 1	;$DEEC = $2C
+SFXC1DataFlags: ds 1	;$DEED = $2D
 SFXC1DataBank: ds 1		;$DEEE = $2E
 SFXC1Unused2F: ds 1		;$DEEF = $2F
 
@@ -6840,11 +6859,11 @@ SECTION "Audio RAM SFXC2", WRAMX[SFXC2RAM]
 SFXC2MusNum: ds 1		;$DF00 = $00
 SFXC2Priority: ds 1		;$DF01 = $01
 SFXC2Sweep: ds 1		;$DF02 = $02
-SFXC2Transpose: ds 1		;$DF03 = $03
+SFXC2Transpose: ds 1	;$DF03 = $03
 SFXC2Tuning: ds 1		;$DF04 = $04
 SFXC2VolFinal: ds 1		;$DF05 = $05
-SFXC2VolOutput: ds 1		;$DF06 = $06
-SFXC2NoteDelay: ds 2		;$DF07 = $07
+SFXC2VolOutput: ds 1	;$DF06 = $06
+SFXC2NoteDelay: ds 2	;$DF07 = $07
 SFXC2Speed: ds 1		;$DF09 = $09
 SFXC2DutyVol: ds 1		;$DF0A = $0A
 SFXC2Decay: ds 1		;$DF0B = $0B
@@ -6853,26 +6872,26 @@ SFXC2Vibrato: ds 2		;$DF0D = $0D
 SFXC2EnvVal: ds 1		;$DF0F = $0F
 SFXC2Decay2: ds 1		;$DF10 = $10
 SFXC2Decay3: ds 1		;$DF11 = $11
-SFXC2ReleaseTime: ds 2		;$DF12 = $12
-SFXC2EnvSeqPtr: ds 2		;$DF14 = $14
+SFXC2ReleaseTime: ds 2	;$DF12 = $12
+SFXC2EnvSeqPtr: ds 2	;$DF14 = $14
 SFXC2VibStep: ds 1		;$DF16 = $16
-SFXC2EnvSeqPos: ds 1		;$DF17 = $17
+SFXC2EnvSeqPos: ds 1	;$DF17 = $17
 SFXC2EnvStep: ds 1		;$DF18 = $18
-SFXC2VibSeqDelay: ds 1		;$DF19 = $19
+SFXC2VibSeqDelay: ds 1	;$DF19 = $19
 SFXC2EnvDur: ds 1		;$DF1A = $1A
 SFXC2Octave: ds 1		;$DF1B = $1B
 SFXC2VibVal: ds 1		;$DF1C = $1C
-SFXC2Freq: ds 2		;$DF1D = $1D
+SFXC2Freq: ds 2			;$DF1D = $1D
 SFXC2VolCur: ds 1		;$DF1F = $1F
 SFXC2SongPos: ds 2		;$DF20 = $20
-SFXC2Repeat1Start: ds 2		;$DF22 = $22
-SFXC2Repeat2Start: ds 2		;$DF24 = $24
-SFXC2Macro1Pos: ds 2		;$DF26 = $26
-SFXC2Macro2Pos: ds 2		;$DF28 = $28
-SFXC2Repeat1Times: ds 1		;$DF2A = $2A
-SFXC2Repeat2Times: ds 1		;$DF2B = $2B
-SFXC2NoteFlags: ds 1		;$DF2C = $2C
-SFXC2DataFlags: ds 1		;$DF2D = $2D
+SFXC2Repeat1Start: ds 2	;$DF22 = $22
+SFXC2Repeat2Start: ds 2	;$DF24 = $24
+SFXC2Macro1Pos: ds 2	;$DF26 = $26
+SFXC2Macro2Pos: ds 2	;$DF28 = $28
+SFXC2Repeat1Times: ds 1	;$DF2A = $2A
+SFXC2Repeat2Times: ds 1	;$DF2B = $2B
+SFXC2NoteFlags: ds 1	;$DF2C = $2C
+SFXC2DataFlags: ds 1	;$DF2D = $2D
 SFXC2DataBank: ds 1		;$DF2E = $2E
 SFXC2Unused2F: ds 1		;$DF2F = $2F
 
@@ -6880,11 +6899,11 @@ SECTION "Audio RAM SFXC3", WRAMX[SFXC3RAM]
 SFXC3MusNum: ds 1		;$DF30 = $00
 SFXC3Priority: ds 1		;$DF31 = $01
 SFXC3Sweep: ds 1		;$DF32 = $02
-SFXC3Transpose: ds 1		;$DF33 = $03
+SFXC3Transpose: ds 1	;$DF33 = $03
 SFXC3Tuning: ds 1		;$DF34 = $04
 SFXC3VolFinal: ds 1		;$DF35 = $05
-SFXC3VolOutput: ds 1		;$DF36 = $06
-SFXC3NoteDelay: ds 2		;$DF37 = $07
+SFXC3VolOutput: ds 1	;$DF36 = $06
+SFXC3NoteDelay: ds 2	;$DF37 = $07
 SFXC3Speed: ds 1		;$DF39 = $09
 SFXC3DutyVol: ds 1		;$DF3A = $0A
 SFXC3Decay: ds 1		;$DF3B = $0B
@@ -6893,26 +6912,26 @@ SFXC3Vibrato: ds 2		;$DF3D = $0D
 SFXC3EnvVal: ds 1		;$DF3F = $0F
 SFXC3Decay2: ds 1		;$DF40 = $10
 SFXC3Decay3: ds 1		;$DF41 = $11
-SFXC3ReleaseTime: ds 2		;$DF42 = $12
-SFXC3EnvSeqPtr: ds 2		;$DF44 = $14
+SFXC3ReleaseTime: ds 2	;$DF42 = $12
+SFXC3EnvSeqPtr: ds 2	;$DF44 = $14
 SFXC3VibStep: ds 1		;$DF46 = $16
-SFXC3EnvSeqPos: ds 1		;$DF47 = $17
+SFXC3EnvSeqPos: ds 1	;$DF47 = $17
 SFXC3EnvStep: ds 1		;$DF48 = $18
-SFXC3VibSeqDelay: ds 1		;$DF49 = $19
+SFXC3VibSeqDelay: ds 1	;$DF49 = $19
 SFXC3EnvDur: ds 1		;$DF4A = $1A
 SFXC3Octave: ds 1		;$DF4B = $1B
 SFXC3VibVal: ds 1		;$DF4C = $1C
-SFXC3Freq: ds 2		;$DF4D = $1D
+SFXC3Freq: ds 2			;$DF4D = $1D
 SFXC3VolCur: ds 1		;$DF4F = $1F
 SFXC3SongPos: ds 2		;$DF50 = $20
-SFXC3Repeat1Start: ds 2		;$DF52 = $22
-SFXC3Repeat2Start: ds 2		;$DF54 = $24
-SFXC3Macro1Pos: ds 2		;$DF56 = $26
-SFXC3Macro2Pos: ds 2		;$DF58 = $28
-SFXC3Repeat1Times: ds 1		;$DF5A = $2A
-SFXC3Repeat2Times: ds 1		;$DF5B = $2B
-SFXC3NoteFlags: ds 1		;$DF5C = $2C
-SFXC3DataFlags: ds 1		;$DF5D = $2D
+SFXC3Repeat1Start: ds 2	;$DF52 = $22
+SFXC3Repeat2Start: ds 2	;$DF54 = $24
+SFXC3Macro1Pos: ds 2	;$DF56 = $26
+SFXC3Macro2Pos: ds 2	;$DF58 = $28
+SFXC3Repeat1Times: ds 1	;$DF5A = $2A
+SFXC3Repeat2Times: ds 1	;$DF5B = $2B
+SFXC3NoteFlags: ds 1	;$DF5C = $2C
+SFXC3DataFlags: ds 1	;$DF5D = $2D
 SFXC3DataBank: ds 1		;$DF5E = $2E
 SFXC3Unused2F: ds 1		;$DF5F = $2F
 
@@ -6920,11 +6939,11 @@ SECTION "Audio RAM SFXC4", WRAMX[SFXC4RAM]
 SFXC4MusNum: ds 1		;$DF60 = $00
 SFXC4Priority: ds 1		;$DF61 = $01
 SFXC4Sweep: ds 1		;$DF62 = $02
-SFXC4Transpose: ds 1		;$DF63 = $03
+SFXC4Transpose: ds 1	;$DF63 = $03
 SFXC4Tuning: ds 1		;$DF64 = $04
 SFXC4VolFinal: ds 1		;$DF65 = $05
-SFXC4VolOutput: ds 1		;$DF66 = $06
-SFXC4NoteDelay: ds 2		;$DF67 = $07
+SFXC4VolOutput: ds 1	;$DF66 = $06
+SFXC4NoteDelay: ds 2	;$DF67 = $07
 SFXC4Speed: ds 1		;$DF69 = $09
 SFXC4DutyVol: ds 1		;$DF6A = $0A
 SFXC4Decay: ds 1		;$DF6B = $0B
@@ -6933,46 +6952,48 @@ SFXC4Vibrato: ds 2		;$DF6D = $0D
 SFXC4EnvVal: ds 1		;$DF6F = $0F
 SFXC4Decay2: ds 1		;$DF70 = $10
 SFXC4Decay3: ds 1		;$DF71 = $11
-SFXC4ReleaseTime: ds 2		;$DF72 = $12
-SFXC4EnvSeqPtr: ds 2		;$DF74 = $14
+SFXC4ReleaseTime: ds 2	;$DF72 = $12
+SFXC4EnvSeqPtr: ds 2	;$DF74 = $14
 SFXC4VibStep: ds 1		;$DF76 = $16
-SFXC4EnvSeqPos: ds 1		;$DF77 = $17
+SFXC4EnvSeqPos: ds 1	;$DF77 = $17
 SFXC4EnvStep: ds 1		;$DF78 = $18
-SFXC4VibSeqDelay: ds 1		;$DF79 = $19
+SFXC4VibSeqDelay: ds 1	;$DF79 = $19
 SFXC4EnvDur: ds 1		;$DF7A = $1A
 SFXC4Octave: ds 1		;$DF7B = $1B
 SFXC4VibVal: ds 1		;$DF7C = $1C
-SFXC4Freq: ds 2		;$DF7D = $1D
+SFXC4Freq: ds 2			;$DF7D = $1D
 SFXC4VolCur: ds 1		;$DF7F = $1F
 SFXC4SongPos: ds 2		;$DF80 = $20
-SFXC4Repeat1Start: ds 2		;$DF82 = $22
-SFXC4Repeat2Start: ds 2		;$DF84 = $24
-SFXC4Macro1Pos: ds 2		;$DF86 = $26
-SFXC4Macro2Pos: ds 2		;$DF88 = $28
-SFXC4Repeat1Times: ds 1		;$DF8A = $2A
-SFXC4Repeat2Times: ds 1		;$DF8B = $2B
-SFXC4NoteFlags: ds 1		;$DF8C = $2C
-SFXC4DataFlags: ds 1		;$DF8D = $2D
+SFXC4Repeat1Start: ds 2	;$DF82 = $22
+SFXC4Repeat2Start: ds 2	;$DF84 = $24
+SFXC4Macro1Pos: ds 2	;$DF86 = $26
+SFXC4Macro2Pos: ds 2	;$DF88 = $28
+SFXC4Repeat1Times: ds 1	;$DF8A = $2A
+SFXC4Repeat2Times: ds 1	;$DF8B = $2B
+SFXC4NoteFlags: ds 1	;$DF8C = $2C
+SFXC4DataFlags: ds 1	;$DF8D = $2D
 SFXC4DataBank: ds 1		;$DF8E = $2E
 SFXC4Unused2F: ds 1		;$DF8F = $2F
 
 SECTION "Audio Variables", WRAMX[$DEF0]
 CurTrack: ds 1			;$DEF0
-CurTrackCheck: ds 1			;$DEF1
+CurTrackCheck: ds 1		;$DEF1
 SFXNum: ds 1			;$DEF2
-Temp1: ds 1			;$DEF3
-Temp2: ds 1			;$DEF4
+Temp1: ds 1				;$DEF3
+Temp2: ds 1				;$DEF4
 Output: ds 1			;$DEF5
 SongBank: ds 1			;$DEF6
 NewWave: ds 1			;$DEF7
-Fade: ds 1			;$DEF8
+Fade: ds 1				;$DEF8
 FadeTime: ds 1			;$DEF9
-MusPlaying: ds 1			;$DEFA
+MusPlaying: ds 1		;$DEFA
 Gate1Off: ds 1			;$DEFB
 Gate2Off: ds 1			;$DEFC
 Gate3Off: ds 1			;$DEFD
 Gate4Off: ds 1			;$DEFE
-Var0F: ds 1			;$DEFF
+
+;The block ends here: it fills exactly the 16 bytes between SFXC1RAM and
+;SFXC2RAM, and nothing ever touches the last one at $DEFF.
 
 SECTION "Audio Registers", WRAMX[$DF90]
 NR10Val: ds 1			;$DF90
@@ -6996,24 +7017,7 @@ NR44Val: ds 1			;$DFA1
 NR50Val: ds 1			;$DFA2
 NR51Val: ds 1			;$DFA3
 NR52Val: ds 1			;$DFA4
-NR10ValCopy: ds 1			;$DFA5
-NR11ValCopy: ds 1			;$DFA6
-NR12ValCopy: ds 1			;$DFA7
-NR13ValCopy: ds 1			;$DFA8
-NR14ValCopy: ds 1			;$DFA9
-NR21ValCopy: ds 1			;$DFAA
-NR22ValCopy: ds 1			;$DFAB
-NR23ValCopy: ds 1			;$DFAC
-NR24ValCopy: ds 1			;$DFAD
-NR30ValCopy: ds 1			;$DFAE
-NR31ValCopy: ds 1			;$DFAF
-NR32ValCopy: ds 1			;$DFB0
-NR33ValCopy: ds 1			;$DFB1
-NR34ValCopy: ds 1			;$DFB2
-NR41ValCopy: ds 1			;$DFB3
-NR42ValCopy: ds 1			;$DFB4
-NR43ValCopy: ds 1			;$DFB5
-NR44ValCopy: ds 1			;$DFB6
-NR50ValCopy: ds 1			;$DFB7
-NR51ValCopy: ds 1			;$DFB8
-NR52ValCopy: ds 1			;$DFB9
+
+;Mega Man III keeps a second copy of every register after this. Pocket King does
+;not - OutputRegTrig and OutputRegMasked read the hardware back with
+;`ldh a, [c]` instead, so the engine's RAM ends at $DFA4.
