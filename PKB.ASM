@@ -1,7 +1,7 @@
 ;Pocket King audio disassembly - bank 2
 ;Disassembly by Will Trowbridge & Claude
 
-SECTION "Audio 2", ROMX[AudioROM], BANK[AudioBank2]
+SECTION "Audio 2", ROMX[AudioROM], BANK[PlayerBank2]
 
 Mus46B:
 	db $D5, $01, $A2, $37, $8B, $46, $A4

@@ -324,7 +324,7 @@ ClearZero:							;General cleanup function
 ;bank a track's data lives in and swaps this one back, so the engine bank has
 ;to be re-mapped before every call into it.
 SetAudioBank:
-	ld a, AudioBank1
+	ld a, PlayerBank1
 	ld [$2000], a					;Bank number (low 8 bits)
 	xor a
 	ld [$3000], a					;Bank number (bit 8)
